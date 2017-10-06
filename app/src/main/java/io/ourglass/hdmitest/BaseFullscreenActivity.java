@@ -1,7 +1,7 @@
 package io.ourglass.hdmitest;
 
+import android.app.Activity;
 import android.os.Build;
-import android.support.v4.app.FragmentActivity;
 import android.util.Log;
 import android.view.View;
 import android.view.WindowManager;
@@ -10,7 +10,7 @@ import android.view.WindowManager;
  * Created by mkahn on 5/22/17.
  */
 
-public class BaseFullscreenActivity extends FragmentActivity {
+public class BaseFullscreenActivity extends Activity {
 
     public static final String TAG = "BaseFullscreenActivity";
 
