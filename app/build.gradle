@@ -2,13 +2,13 @@ apply plugin: 'com.android.application'
 
 android {
     signingConfigs {
-//        config {
-//            keyAlias 'DebugKey'
-//            keyPassword 'password'
-//            storeFile file('keys/debug.jks')
-//            storePassword 'password'
-//            v2SigningEnabled false
-//        }
+        config {
+            keyAlias 'DebugKey'
+            keyPassword 'password'
+            storeFile file('keys/debug.jks')
+            storePassword 'password'
+            v2SigningEnabled false
+        }
         release {
             keyAlias 'OurglassTV'
             keyPassword 'D@rkB0ck'
@@ -38,6 +38,8 @@ android {
         debug {
             minifyEnabled false
             //proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            // MAK: I thought if this were .debug it would fail opening the driver, but it doesn't seem
+            // to matter.
             signingConfig signingConfigs.release
             jniDebuggable false
         }

@@ -64,14 +64,15 @@ public class RtkHdmiWrapper {
     public interface RtkWrapperListener {
 
         public void error(OGHdmiError error, String msg);
-
         public void hdmiStateChange(OGHdmiState state);
+        public void fyi(String msg);
 
     }
 
     private RtkWrapperListener mListener;
 
     private Context mContext;
+    public boolean debugMode = false;
 
 
     // Views
@@ -117,9 +118,16 @@ public class RtkHdmiWrapper {
      * @param viewGroupToInsertSurfaceViewInto
      */
     public RtkHdmiWrapper(Context mContext, ViewGroup viewGroupToInsertSurfaceViewInto, RtkWrapperListener listener) {
+        this(mContext, viewGroupToInsertSurfaceViewInto, listener, false);
+    }
+
+    public RtkHdmiWrapper(Context mContext, ViewGroup viewGroupToInsertSurfaceViewInto, RtkWrapperListener listener, boolean debugMode){
+
         this.mContext = mContext;
         this.mSurfaceHolderView = viewGroupToInsertSurfaceViewInto;
         this.mListener = listener;
+        this.debugMode = debugMode;
+
         registerBroadcastRx();
         initView();
         initStreamer();
@@ -280,6 +288,34 @@ public class RtkHdmiWrapper {
         }
     }
 
+    /**
+     * Calls back fyi to listener if one is registered.
+     *
+     * @param msg
+     */
+    private void fyiCallback( String msg ) {
+        if (mListener != null) {
+            mListener.fyi(msg);
+        }
+    }
+
+    private void sendFYIStatus(HDMIRxStatus rxStatus){
+
+        if (debugMode){
+            StringBuilder sb = new StringBuilder("RxManager Status:\n");
+            sb.append("type = "+rxStatus.type + "\n");
+            sb.append("status = "+rxStatus.status + "\n");
+            sb.append("width = "+rxStatus.width + "\n");
+            sb.append("height = "+rxStatus.height + "\n");
+            sb.append("scanMode = "+rxStatus.scanMode + "\n");
+            sb.append("color = "+rxStatus.color + "\n");
+            sb.append("freq = "+rxStatus.freq + "\n");
+            sb.append("spdif = "+rxStatus.spdif + "\n");
+            sb.append("audioStatus = "+rxStatus.audioStatus + "\n");
+            fyiCallback(sb.toString());
+        }
+    }
+
     private void orderlyShutdownDriver() {
 
         Log.d(TAG, "orderlyShutdownDriver shutdown called");
@@ -305,11 +341,26 @@ public class RtkHdmiWrapper {
 
     }
 
+    public void cleanUpBadManager(){
+        try {
+            mHDMIRX.release();
+        } catch (Exception e){
+            Log.wtf(TAG, "Shat meself cleaning up manager");
+            Log.wtf(TAG, e.getMessage());
+        } finally {
+            mHDMIRX = null;
+        }
+
+        errorCallback(FYI, "Cleaned up RxManager");
+    }
+
     public void initHDMIDriver() {
 
         if (mHDMIRX == null) {
             Log.d(TAG, "initHDMIDriver called and there is no HDMIRxManager (null), creating");
             Log.d(TAG, "...this is normal, relax.");
+
+            fyiCallback("Creating new RxManager instance");
 
             driverReady = false;
             mWidth = 0;
@@ -324,11 +375,12 @@ public class RtkHdmiWrapper {
                 Log.wtf(TAG, "initHDMIDriver: rxStatus from chipset is NULL. This is a hard fucking fail!");
                 errorCallback(OGHdmiError.HDMI_UNAVAILABLE, "NULL status returned. This blows hard.");
                 // Just in case, orderly shutdown
-                orderlyShutdownDriver();
+                cleanUpBadManager();
 
             } else if (rxStatus.status == HDMIRxStatus.STATUS_READY) {
 
                 Log.v(TAG, "initHDMIDriver: HDMI status is STATUS_READY, trying open driver.");
+                sendFYIStatus(rxStatus);
 
                 // This registers package name with underlying shitty C code
                 //if (mHDMIRX.open() != 0) {
@@ -338,10 +390,11 @@ public class RtkHdmiWrapper {
 
                     // SUPER FUCKING IMPORTANT!!!
                     // Your entire view hierarchy is now POISONED. If you touch anything, the underlying driver will crash!!!
+                    // Well, it looks like this is another inconsistency. Can't replicate this now.
+
                     Log.d(TAG, "initHDMIDriver: Could not open driver. Probably we are fucked. Attempting release(), better close your eyes.");
-                    // Release does nothing
-                    //mHDMIRX.release();
-                    errorCallback(OGHdmiError.HDMI_CANT_OPEN_DRIVER, "Could not open the driver. This blows hard.");
+                    cleanUpBadManager();
+                    errorCallback(OGHdmiError.HDMI_CANT_OPEN_DRIVER, "Could not open the driver.");
                     orderlyShutdownDriver();
 
                 } else {
@@ -350,6 +403,9 @@ public class RtkHdmiWrapper {
                     Log.d(TAG, "initHDMIDriver: successfully opened the driver. So we got that going for us.");
                     HDMIRxParameters hdmirxGetParam = mHDMIRX.getParameters();
                     Log.v(TAG, "initHDMIDriver: Params from driver: " + hdmirxGetParam.flatten());
+                    fyiCallback("Params from driver: \n");
+                    fyiCallback(hdmirxGetParam.flatten());
+
                     getSupportedPreviewSize(hdmirxGetParam, rxStatus.width, rxStatus.height);
                     mFps = getSupportedPreviewFrameRate(hdmirxGetParam);
 
@@ -373,10 +429,11 @@ public class RtkHdmiWrapper {
                 }
 
             } else {
+                sendFYIStatus(rxStatus);
                 Log.d(TAG, "initHDMIDriver:  got an non-ready status from the driver. Fuck.");
                 Log.d(TAG, "initHDMIDriver:  Status ( 0 = not ready ): " + rxStatus.status);
-                errorCallback(OGHdmiError.HDMI_UNAVAILABLE, "Got non-ready status from driver.");
-                orderlyShutdownDriver();
+                errorCallback(OGHdmiError.HDMI_UNAVAILABLE, "Got non-ready status from driver. Unplugged?");
+                cleanUpBadManager();
             }
 
 

@@ -8,6 +8,7 @@ import android.view.LayoutInflater;
 import android.view.View;
 import android.widget.RelativeLayout;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import io.ourglass.hdmitest.RtkHdmiWrapper;
 import io.ourglass.hdmitest.R;
@@ -56,14 +57,19 @@ public class HDMIView2 extends RelativeLayout {
 
                 case HDMI_CANT_OPEN_DRIVER:
                     // this is a fucking, we're done
+                    mHdmiHolder.setVisibility(View.INVISIBLE);
                     mHdmiErrorTextView.setText("CAN'T ACQUIRE DRIVER");
+                    break;
+
+                case FYI:
+                    Log.d(TAG, "FYI error: "+msg);
                     break;
 
                 default:
                     mHdmiErrorTextView.setText(error.name());
             }
 
-            mHdmiHolder.setVisibility(View.INVISIBLE);
+            //mHdmiHolder.setVisibility(View.INVISIBLE);
             mHdmiErrorTextView.setVisibility(View.VISIBLE);
         }
 
@@ -95,7 +101,13 @@ public class HDMIView2 extends RelativeLayout {
                     Log.d(TAG, "State ignored");
             }
 
+        }
 
+        @Override
+        public void fyi(String msg){
+            if (mDebugMode) {
+                addDebugMessage(msg + "\n");
+            }
 
         }
     };
@@ -172,13 +184,13 @@ public class HDMIView2 extends RelativeLayout {
         mHdmiErrorTextView = (TextView)v.findViewById(R.id.home_ac_hdmi_nosignal_text_view);
 
         mDebugErrorTV = (TextView) v.findViewById(R.id.textViewErr);
-        mDebugErrorTV.setText("");
+        mDebugErrorTV.setText("**** ERRORS ****");
 
         mDebugStateTV = (TextView) v.findViewById(R.id.textViewState);
-        mDebugStateTV.setText("");
+        mDebugStateTV.setText("**** STATE ****");
 
         mDebugMsgTV = (TextView) v.findViewById(R.id.textViewMsg);
-        mDebugMsgTV.setText("");
+        mDebugMsgTV.setText("**** MESSAGES ****");
 
         updateDebugViews();
 
@@ -199,7 +211,7 @@ public class HDMIView2 extends RelativeLayout {
     public void start(HDMIViewListener listener){
 
         mListener = listener;
-        rtkHdmiWrapper = new RtkHdmiWrapper(mContext, mHdmiHolder, mRtkWrapperListener);
+        rtkHdmiWrapper = new RtkHdmiWrapper(mContext, mHdmiHolder, mRtkWrapperListener, mDebugMode);
 
     }
 
@@ -208,7 +220,12 @@ public class HDMIView2 extends RelativeLayout {
 
 
     public void initRtkDriver(){
-        rtkHdmiWrapper.initHDMIDriver();
+        if ( rtkHdmiWrapper != null ) {
+            rtkHdmiWrapper.initHDMIDriver();
+        } else {
+            addDebugErrorMessage("Can't init driver before it exists!");
+            Toast.makeText(mContext, "No Wrapper Yet, Homeboy", Toast.LENGTH_SHORT).show();
+        }
     }
 
     public void resume() {
