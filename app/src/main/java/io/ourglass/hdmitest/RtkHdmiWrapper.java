@@ -377,7 +377,7 @@ public class RtkHdmiWrapper {
                 // Just in case, orderly shutdown
                 cleanUpBadManager();
 
-            } else if (rxStatus.status == HDMIRxStatus.STATUS_READY) {
+            } else if (true) { //rxStatus.status == HDMIRxStatus.STATUS_READY) {
 
                 Log.v(TAG, "initHDMIDriver: HDMI status is STATUS_READY, trying open driver.");
                 sendFYIStatus(rxStatus);
