@@ -95,10 +95,12 @@ public class HDMIView2 extends RelativeLayout {
 
                 case HDMI_PHY_CONNECTED:
                     hdmiPHYConnected = true;
-                    startIfReady();
+                    //startIfReady();
+                    break;
 
                 default:
                     Log.d(TAG, "State ignored");
+                    break;
             }
 
         }
@@ -244,7 +246,9 @@ public class HDMIView2 extends RelativeLayout {
                 rtkHdmiWrapper.stopStreamer();
             }
 
-            rtkHdmiWrapper.pause();
+            //rtkHdmiWrapper.pause();
+            rtkHdmiWrapper.pauseMain();
+            hasIssuedPlayToDriver = false;
         }
     }
 
@@ -256,6 +260,13 @@ public class HDMIView2 extends RelativeLayout {
             }
 
             rtkHdmiWrapper.kill();
+        }
+
+    }
+
+    public void release(){
+        if (rtkHdmiWrapper != null) {
+            rtkHdmiWrapper.release();
         }
 
     }
