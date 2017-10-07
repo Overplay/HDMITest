@@ -47,31 +47,25 @@ public class MainActivity extends BaseFullscreenActivity {
     @Override
     public void onResume(){
         super.onResume();
-
+        Log.d(TAG, "onResume called");
     }
 
     @Override
     public void onPause(){
         Log.d(TAG, "onPause called");
-
         super.onPause();
-
     }
 
     @Override
     public void onStop(){
         Log.d(TAG, "onStop called");
-
         super.onStop();
-
     }
 
     @Override
     public void onDestroy(){
         Log.d(TAG, "onDestroy called");
-
         super.onDestroy();
-
     }
 
     public void t(final String msg){
@@ -111,10 +105,18 @@ public class MainActivity extends BaseFullscreenActivity {
         if ( keyCode == KeyEvent.KEYCODE_1 ){
             t("Starting HDMI View Foundation");
             hdmiViewStart();
-        }
-        else if ( keyCode == KeyEvent.KEYCODE_2 ){
+        } else if ( keyCode == KeyEvent.KEYCODE_2 ) {
             t("Starting Rtk Driver");
-            rtkDriverInit();
+            mHDMIView.initRtkDriver();
+        } else if ( keyCode == KeyEvent.KEYCODE_3 ){
+            t("Playing Rtk Driver");
+            mHDMIView.resume();
+        } else if ( keyCode == KeyEvent.KEYCODE_8 ){
+            t("Pausing Rtk Driver");
+            mHDMIView.pause();
+        } else if ( keyCode == KeyEvent.KEYCODE_9 ){
+            t("Releasing Rtk Driver");
+            mHDMIView.release();
         } else {
             t("Pressed key "+keyCode);
         }
@@ -126,6 +128,10 @@ public class MainActivity extends BaseFullscreenActivity {
 
 
     // Actions
+
+    public void rtkDriverPlay(){
+        mHDMIView.resume();
+    }
 
     public void rtkDriverInit(){
         mHDMIView.initRtkDriver();

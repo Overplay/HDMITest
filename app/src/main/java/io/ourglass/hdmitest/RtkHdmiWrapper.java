@@ -271,6 +271,7 @@ public class RtkHdmiWrapper {
      * @param state
      */
     private void stateCallback(OGHdmiState state) {
+        Log.d(TAG, "HDMI stateCallback: " + state.name());
         if (mListener != null) {
             mListener.hdmiStateChange(state);
         }
@@ -385,11 +386,16 @@ public class RtkHdmiWrapper {
                 // This registers package name with underlying shitty C code
                 //if (mHDMIRX.open() != 0) {
 
-                if (mHDMIRX.open() != 0) {
+                int openStatus = mHDMIRX.open();
+                if (openStatus != 0) {
                     // Could not open the driver, so we are probably really fucked
 
                     // SUPER FUCKING IMPORTANT!!!
                     // Your entire view hierarchy is now POISONED. If you touch anything, the underlying driver will crash!!!
+                    Log.d(TAG, "initHDMIDriver: Could not open driver (" + openStatus + "). Probably we are fucked. Attempting release(), better close your eyes.");
+                    // Release does nothing
+                    //mHDMIRX.release();
+                    errorCallback(OGHdmiError.HDMI_CANT_OPEN_DRIVER, "Could not open the driver. This blows hard.");
                     // Well, it looks like this is another inconsistency. Can't replicate this now.
 
                     Log.d(TAG, "initHDMIDriver: Could not open driver. Probably we are fucked. Attempting release(), better close your eyes.");
@@ -407,7 +413,7 @@ public class RtkHdmiWrapper {
                     fyiCallback(hdmirxGetParam.flatten());
 
                     getSupportedPreviewSize(hdmirxGetParam, rxStatus.width, rxStatus.height);
-                    mFps = getSupportedPreviewFrameRate(hdmirxGetParam);
+                    getSupportedPreviewFrameRate(hdmirxGetParam);
 
                     try {
                         mHDMIRX.setPreviewDisplay(mSurfaceHolder);
@@ -487,6 +493,7 @@ public class RtkHdmiWrapper {
 
         if (mHDMIRX != null) {
             Log.v(TAG, "pause() calling stop() on driver..");
+            mHDMIRX.setPlayback(false, false);
             int stopResult = mHDMIRX.stop();
             Log.v(TAG, "pause() result of driver stop was (0=good) " + stopResult);
             Log.v(TAG, "pause() NOT! releasing native driver, maybe this will help.");
@@ -500,6 +507,51 @@ public class RtkHdmiWrapper {
         stateCallback(HDMI_PAUSED);
         //(new SystemStatusMessage(SystemStatusMessage.SystemStatus.HDMI_PAUSE)).post();
 
+    }
+
+    public void pauseMain() {
+
+        Log.v(TAG, "pause() called.");
+        if (mSurfaceView != null) {
+            Log.v(TAG, "pause() NOT hiding Surface View (commented out)");
+            //mSurfaceView.setVisibility(View.INVISIBLE);
+        }
+
+        if (mHDMIRX != null) {
+
+            if (driverReady) {
+                (new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        mHDMIRX.setPlayback(false, false);
+                        int stopResult = mHDMIRX.stop();
+                        iThinkHDMIisPlaying = false;
+                        Log.v(TAG, "pause() result of driver stop was (0=good) " + stopResult);
+                    }
+                })).start();
+            }
+
+            stateCallback(HDMI_PAUSED);
+        }
+        //(new SystemStatusMessage(SystemStatusMessage.SystemStatus.HDMI_PAUSE)).post();
+
+    }
+
+    public void release() {
+        Log.d(TAG, "release() called.");
+        if (mHDMIRX != null ) {
+
+            try {
+                mHDMIRX.setPreviewDisplay(null);
+            } catch (IOException e) {
+            }
+
+            mHDMIRX.release();
+            mHDMIRX = null;
+            driverReady = false;
+            Log.d(TAG, "orderlyShutdownDriver complete");
+
+        }
     }
 
     public void play() {
@@ -521,9 +573,8 @@ public class RtkHdmiWrapper {
             return;
         }
 
-        Log.d(TAG, "play() making surfaceview visible");
-
-        mSurfaceView.setVisibility(View.VISIBLE);
+        //SJMNOLog.d(TAG, "play() making surfaceview visible");
+        //SJMNOmSurfaceView.setVisibility(View.VISIBLE);
 
         Log.v(TAG, "play------------- What I *think* HDMI is playing = " + iThinkHDMIisPlaying + " HDMI surface ready = " + mHDMISurfaceReady);
 
@@ -560,14 +611,14 @@ public class RtkHdmiWrapper {
     }
 
 
-    private int getSupportedPreviewFrameRate(HDMIRxParameters hdmirxGetParam) {
+    private void getSupportedPreviewFrameRate(HDMIRxParameters hdmirxGetParam) {
         List<Integer> previewFrameRates = hdmirxGetParam.getSupportedPreviewFrameRates();
         int fps = 0;
         if (previewFrameRates != null && previewFrameRates.size() > 0)
             fps = previewFrameRates.get(previewFrameRates.size() - 1);
         else
             fps = 30;
-        return fps;
+        mFps = fps;
     }
 
     private void getSupportedPreviewSize(HDMIRxParameters hdmirxGetParam, int rxWidth, int rxHeight) {
