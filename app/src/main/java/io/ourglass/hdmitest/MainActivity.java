@@ -24,11 +24,7 @@ public class MainActivity extends BaseFullscreenActivity {
         Log.d(TAG, "onCreate called");
 
         mHDMIView = (HDMIView2)findViewById(R.id.home_hdmi_parent);
-        mHDMIView.setDebugMode(true);
-
-        mHDMIView.addDebugErrorMessage("ERRORS");
-        mHDMIView.addDebugStateMessage("STATE");
-        mHDMIView.addDebugMessage("MESSAGES");
+        mHDMIView.setmDebugMode(true);
 
     }
 
@@ -96,32 +92,59 @@ public class MainActivity extends BaseFullscreenActivity {
             }
         }, 1000);
 
-
         // 82 = Menu button,
-
         Log.d(TAG, "Button with this code being processed: " + keyCode);
 
-
         if ( keyCode == KeyEvent.KEYCODE_1 ){
-            t("Starting HDMI View Foundation");
-            hdmiViewStart();
+            t("Starting HDMIView SurfaceView");
+            hdmiPrepSurface();
         } else if ( keyCode == KeyEvent.KEYCODE_2 ) {
             t("Starting Rtk Driver");
-            mHDMIView.initRtkDriver();
+            mHDMIView.createDriver();
         } else if ( keyCode == KeyEvent.KEYCODE_3 ){
             t("Playing Rtk Driver");
-            mHDMIView.resume();
+            try {
+                mHDMIView.play();
+            } catch (HDMIStateException e) {
+                t(e.getMessage());
+            }
         } else if ( keyCode == KeyEvent.KEYCODE_8 ){
             t("Pausing Rtk Driver");
-            mHDMIView.pause();
+            try {
+                mHDMIView.pause();
+            } catch (HDMIStateException e) {
+                t(e.getMessage());
+            }
         } else if ( keyCode == KeyEvent.KEYCODE_9 ){
-            t("Releasing Rtk Driver");
+            t("Rtk Driver Shutodwn");
             mHDMIView.release();
+        } else if ( keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE ) {
+
+            t("Starting AutoMode");
+            try {
+                mHDMIView.prepareAuto(new HDMIView2.HDMIViewListener() {
+                    @Override
+                    public void surfaceReady() {
+
+                    }
+
+                    @Override
+                    public void ready() {
+
+                    }
+
+                    @Override
+                    public void error(RtkHdmiWrapper.OGHdmiError error) {
+
+                    }
+                });
+            } catch (HDMIStateException e) {
+                t(e.getMessage());
+            }
+
         } else {
             t("Pressed key "+keyCode);
         }
-
-
 
         return false;
     }
@@ -129,30 +152,34 @@ public class MainActivity extends BaseFullscreenActivity {
 
     // Actions
 
-    public void rtkDriverPlay(){
-        mHDMIView.resume();
-    }
 
-    public void rtkDriverInit(){
-        mHDMIView.initRtkDriver();
-    }
+    public void hdmiPrepSurface(){
 
-    public void hdmiViewStart(){
-        mHDMIView.start(new HDMIView2.HDMIViewListener() {
-            @Override
-            public void ready() {
-                Log.d(TAG, "HDMIView reports ready, starting it.");
-                t("HDMIView reports ready to rock");
-            }
+        try {
+            mHDMIView.prepareManual(new HDMIView2.HDMIViewListener() {
+                @Override
+                public void surfaceReady() {
+                    Log.d(TAG, "HDMIView reports surface ready");
+                    t("HDMIView reports Surface Ready");
+                }
 
-            @Override
-            public void error(RtkHdmiWrapper.OGHdmiError error) {
-                Log.e(TAG, "Error initting HDMIView");
-                t("HDMIView reports ERROR in init! " + error.name());
+                @Override
+                public void ready() {
+                    Log.d(TAG, "HDMIView reports ready, starting it.");
+                    t("HDMIView reports ready to rock");
+                }
 
-            }
+                @Override
+                public void error(RtkHdmiWrapper.OGHdmiError error) {
+                    Log.e(TAG, "Error initting HDMIView");
+                    t("HDMIView reports ERROR in init! " + error.name());
 
-        });
+                }
+
+            });
+        } catch (HDMIStateException e) {
+            t(e.getMessage());
+        }
     }
 
 }

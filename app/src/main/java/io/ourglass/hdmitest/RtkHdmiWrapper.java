@@ -6,11 +6,10 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.Message;
 import android.os.ParcelFileDescriptor;
 import android.util.Log;
 import android.view.SurfaceHolder;
-import android.view.SurfaceView;
-import android.view.View;
 import android.view.ViewGroup;
 import android.widget.RelativeLayout.LayoutParams;
 
@@ -29,14 +28,17 @@ import static io.ourglass.hdmitest.RtkHdmiWrapper.OGHdmiState.HDMI_PHY_CONNECTED
 import static io.ourglass.hdmitest.RtkHdmiWrapper.OGHdmiState.HDMI_PHY_NOT_CONNECTED;
 import static io.ourglass.hdmitest.RtkHdmiWrapper.OGHdmiState.HDMI_PLAY;
 import static io.ourglass.hdmitest.RtkHdmiWrapper.OGHdmiState.HDMI_STOP_AND_RELEASE;
-import static io.ourglass.hdmitest.RtkHdmiWrapper.OGHdmiState.SURFACE_CHANGED;
-import static io.ourglass.hdmitest.RtkHdmiWrapper.OGHdmiState.SURFACE_DESTROYED;
-import static io.ourglass.hdmitest.RtkHdmiWrapper.OGHdmiState.SURFACE_READY;
 
 
 public class RtkHdmiWrapper {
 
     private static final String TAG = "RtkHdmiWrapper";
+
+    // Used by the BG Handler for pressing playHDMI/pause on RtkMgr
+    private static final int PLAY_MSG = 1;
+    private static final int STOP_MSG = 2;
+    private static final int SHUTDOWN_MSG = 3;
+
 
     public enum OGHdmiState {
         HDMI_PHY_CONNECTED,
@@ -52,7 +54,7 @@ public class RtkHdmiWrapper {
     }
 
     public enum OGHdmiError {
-        NULL_SURFACE_VIEW,
+        NULL_SURFACE_HOLDER,
         SURFACE_NOT_READY,
         HDMI_UNAVAILABLE,
         HDMI_UNRECOVERABLE,
@@ -62,31 +64,27 @@ public class RtkHdmiWrapper {
     }
 
     public interface RtkWrapperListener {
-
-        public void error(OGHdmiError error, String msg);
-        public void hdmiStateChange(OGHdmiState state);
-        public void fyi(String msg);
-
+        void error(OGHdmiError error, String msg);
+        void hdmiStateChange(OGHdmiState state);
+        void fyi(String msg);
     }
 
     private RtkWrapperListener mListener;
 
     private Context mContext;
     public boolean debugMode = false;
+    // Coughs out more messages on HDMIView
+    public boolean verboseDebug = false;
 
 
-    // Views
-    private ViewGroup mSurfaceHolderView;
-    private SurfaceView mSurfaceView;
     // interface to the SurfaceView
     private SurfaceHolder mSurfaceHolder;
 
     // Interface to the really shitty underlying driver
     private RtkHDMIRxManager mHDMIRX;
 
-    private Handler mHandler = new Handler();
-    private Handler mHandler2;
-    private HandlerThread mHandlerThread2;
+    private Handler mHandler;
+    private HandlerThread mHandlerThread;
 
     public boolean autoRetryOnHDMIInitFailure = true;
     public boolean autoShutdownOnError = false;
@@ -95,8 +93,9 @@ public class RtkHdmiWrapper {
     private BroadcastReceiver mHdmiRxHotPlugReceiver;
     private boolean hdmiConnectedState = false;
 
-
     private boolean mHDMISurfaceReady = false;
+
+
     private final static int DISPLAY = 0;
     private final static int DISPLAYTIME = 200;
     private int mFps = 0;
@@ -107,95 +106,421 @@ public class RtkHdmiWrapper {
     // with no feedback from H/W
     private boolean iThinkHDMIisPlaying = false;
     private ViewGroup mRootView = null;
-    private ParcelFileDescriptor[] ffPipe = null;
-    //private AudioStreamer mAudioStreamer = null;
-    private boolean isStreaming = false;
+
+
+    /**
+     * RtkHdmiWrapper
+     * Constructor for non-debug mode
+     *
+     * @param context
+     * @param surfaceHolder
+     * @param listener
+     */
+    public RtkHdmiWrapper(Context context, SurfaceHolder surfaceHolder, RtkWrapperListener listener) {
+        this(context, surfaceHolder, listener, false);
+    }
 
     /**
      * RtkHdmiWrapper
      *
-     * @param mContext
-     * @param viewGroupToInsertSurfaceViewInto
+     * @param context
+     * @param surfaceHolder
+     * @param listener
+     * @param debugMode
      */
-    public RtkHdmiWrapper(Context mContext, ViewGroup viewGroupToInsertSurfaceViewInto, RtkWrapperListener listener) {
-        this(mContext, viewGroupToInsertSurfaceViewInto, listener, false);
-    }
+    public RtkHdmiWrapper(Context context, SurfaceHolder surfaceHolder, RtkWrapperListener listener, boolean debugMode){
 
-    public RtkHdmiWrapper(Context mContext, ViewGroup viewGroupToInsertSurfaceViewInto, RtkWrapperListener listener, boolean debugMode){
-
-        this.mContext = mContext;
-        this.mSurfaceHolderView = viewGroupToInsertSurfaceViewInto;
+        this.mContext = context;
+        this.mSurfaceHolder = surfaceHolder;
         this.mListener = listener;
         this.debugMode = debugMode;
 
-        registerBroadcastRx();
-        initView();
-        initStreamer();
-    }
-
-    public void delayPlayHDMI(int delayMs) {
-
-        Log.d(TAG, "delayPlayHDMI called. Waiting: " + delayMs);
-        mHandler.postDelayed(new Runnable() {
+        // We've learned playback methods need to be called from a background thread, or at the minimum
+        // a handler on the same thread (this part makes no sense). So this handler is for that.
+        mHandlerThread = new HandlerThread("PlaybackControlThread");
+        mHandlerThread.start();
+        mHandler = new Handler(mHandlerThread.getLooper()){
             @Override
-            public void run() {
-                Log.d(TAG, "delayPlayHDMI executing");
-                play();
+            public void handleMessage(Message msg) {
+                switch (msg.what) {
+                    case PLAY_MSG: {
+                       playAction();
+                        break;
+                    }
+                    case STOP_MSG:
+                        stopAction();
+                        break;
+
+                    default:
+                        break;
+                }
             }
-        }, delayMs);
+        };
+
+        registerBroadcastRx();
+        initStreamer();
 
     }
 
-    private void retryInitHDMI(int delayMs) {
+    // This won't do dick-all for force-kills, I think.
+    private void setupCrashHandler(){
+        Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
+            @Override
+            public void uncaughtException(Thread paramThread, Throwable paramThrowable) {
+                Log.e(TAG,"Uncaught excpetion, releasing HDMI.");
+                orderlyShutdownDriver();
+            }
+        });
+    }
 
-        Log.d(TAG, "retryInitHDMI called");
-        if (autoRetryOnHDMIInitFailure) {
-            mHandler.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    Log.d(TAG, "retryInitHDMI executing");
-                    initHDMIDriver();
-                }
-            }, delayMs);
+    // should only be called from sep thread, via Handler
+    private void playAction(){
+        mHDMIRX.play();
+        iThinkHDMIisPlaying = true;
+        //mHDMIRX.setPlayback(true, true);
+        Log.d(TAG, "hdmi mIsPlaying successfully, I hope");
+    }
+
+    // should only be called from sep thread, via Handler
+    private void stopAction(){
+        //mHDMIRX.setPlayback(false, false);
+        int stopResult = mHDMIRX.stop();
+        iThinkHDMIisPlaying = false;
+        Log.d(TAG, "pause() result of driver stop was (0=good) " + stopResult);
+    }
+
+    private void shutdownAction(){
+
+        stopAction();
+
+    }
+
+    private void registerBroadcastRx() {
+
+        mHdmiRxHotPlugReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                hdmiConnectedState = intent.getBooleanExtra(HDMIRxStatus.EXTRA_HDMIRX_PLUGGED_STATE, false);
+                Log.v(TAG, "HDMI Connected state received is " + hdmiConnectedState);
+                OGHdmiState cstate = hdmiConnectedState ? HDMI_PHY_CONNECTED : HDMI_PHY_NOT_CONNECTED;
+                stateCallback(cstate);
+            }
+        };
+
+        IntentFilter hdmiRxFilter = new IntentFilter(HDMIRxStatus.ACTION_HDMIRX_PLUGGED);
+
+        // Read it once.
+        Intent pluggedStatus = mContext.registerReceiver(null, hdmiRxFilter);
+        // this could be invalid...
+        hdmiConnectedState = pluggedStatus.getBooleanExtra(HDMIRxStatus.EXTRA_HDMIRX_PLUGGED_STATE, false);
+        Log.v(TAG, "registerBroadcastRx Connected state read directly is " + hdmiConnectedState);
+
+        // Watch it.
+        mContext.registerReceiver(mHdmiRxHotPlugReceiver, hdmiRxFilter);
+
+    }
+
+    public void unregisterBroadcastRx(){
+        if (mHdmiRxHotPlugReceiver != null) {
+            mContext.unregisterReceiver(mHdmiRxHotPlugReceiver);
+            mHdmiRxHotPlugReceiver = null;
+        }
+    }
+
+    public boolean areHdmiPHYAndDriverConnected(){
+
+        if (mHDMIRX!=null){
+            return mHDMIRX.isHDMIRxPlugged();
         } else {
-            Log.d(TAG, "Autoretry disabled, so fuckoff");
+            return false;
+        }
+    }
+
+
+    /**
+     * Calls back state change to listener if one is registered.
+     * @param state
+     */
+    private void stateCallback(OGHdmiState state) {
+        Log.d(TAG, "HDMI stateCallback: " + state.name());
+        if (mListener != null) {
+            mListener.hdmiStateChange(state);
+        }
+    }
+
+    /**
+     * Calls backerror to listener if one is registered.
+     * @param error
+     * @param msg
+     */
+    private void errorCallback(OGHdmiError error, String msg) {
+        if (mListener != null) {
+            mListener.error(error, msg);
+        }
+    }
+
+    /**
+     * Calls back fyi to listener if one is registered.
+     * @param msg
+     */
+    private void fyiCallback( String msg ) {
+        if (mListener != null) {
+            mListener.fyi(msg);
+        }
+    }
+
+    // Probably only ever use this during dev
+    private void sendFYIStatus(HDMIRxStatus rxStatus){
+        if (debugMode && verboseDebug){
+            StringBuilder sb = new StringBuilder("RxManager Status:\n");
+            sb.append("type = "+rxStatus.type + "\n");
+            sb.append("status = "+rxStatus.status + "\n");
+            sb.append("width = "+rxStatus.width + "\n");
+            sb.append("height = "+rxStatus.height + "\n");
+            sb.append("scanMode = "+rxStatus.scanMode + "\n");
+            sb.append("color = "+rxStatus.color + "\n");
+            sb.append("freq = "+rxStatus.freq + "\n");
+            sb.append("spdif = "+rxStatus.spdif + "\n");
+            sb.append("audioStatus = "+rxStatus.audioStatus + "\n");
+            fyiCallback(sb.toString());
+        }
+    }
+
+
+
+    public void initHDMIDriver() {
+
+        if (mHDMIRX == null) {
+            Log.d(TAG, "initHDMIDriver called and there is no HDMIRxManager (null), creating");
+            Log.d(TAG, "...this is normal, relax.");
+
+            fyiCallback("Creating new RxManager instance");
+
+            driverReady = false;
+            mWidth = 0;
+            mHeight = 0;
+
+            mHDMIRX = new RtkHDMIRxManager();
+
+            HDMIRxStatus rxStatus = mHDMIRX.getHDMIRxStatus();
+
+            if (rxStatus == null) {
+
+                Log.wtf(TAG, "initHDMIDriver: rxStatus from chipset is NULL. This is a hard fucking fail!");
+                errorCallback(OGHdmiError.HDMI_UNAVAILABLE, "NULL status returned. This blows hard.");
+                // Just in case, orderly shutdown
+                //cleanUpBadManager();
+                orderlyShutdownDriver();
+
+            } else if (rxStatus.status == HDMIRxStatus.STATUS_READY) {
+
+                Log.v(TAG, "initHDMIDriver: HDMI status is STATUS_READY, trying open driver.");
+                sendFYIStatus(rxStatus);
+
+                // This registers package name with underlying shitty C code
+                //if (mHDMIRX.open() != 0) {
+
+                int openStatus = mHDMIRX.open();
+                if (openStatus != 0) {
+                    // Could not open the driver, so we are probably really fucked
+
+                    // SUPER FUCKING IMPORTANT!!!
+                    // Your entire view hierarchy is now POISONED. If you touch anything, the underlying driver will crash!!!
+                    // Well, it looks like this is another inconsistency. Can't replicate this now.
+
+                    Log.d(TAG, "initHDMIDriver: Could not open driver (" + openStatus + "). Probably we are fucked. Attempting releaseHDMI(), better close your eyes.");
+                    //cleanUpBadManager(); // This was MAK's releaser
+                    errorCallback(OGHdmiError.HDMI_CANT_OPEN_DRIVER, "Could not open the driver.");
+                    orderlyShutdownDriver();
+
+                } else {
+
+                    // So good so far
+                    Log.d(TAG, "initHDMIDriver: successfully opened the driver. So we got that going for us.");
+                    HDMIRxParameters hdmirxGetParam = mHDMIRX.getParameters();
+                    Log.v(TAG, "initHDMIDriver: Params from driver: " + hdmirxGetParam.flatten());
+                    sendFYIStatus(rxStatus);
+
+                    getSupportedPreviewSize(hdmirxGetParam, rxStatus.width, rxStatus.height);
+                    getSupportedPreviewFrameRate(hdmirxGetParam);
+
+                    try {
+                        mHDMIRX.setPreviewDisplay(mSurfaceHolder);
+                        // configureTargetFormat
+                        HDMIRxParameters hdmirxParam = new HDMIRxParameters();
+                        Log.v(TAG, "initHDMIDriver: hdmi setPreviewSize  mWidth = " + mWidth + "  mHeight = " + mHeight + "  mFps = " + mFps);
+                        hdmirxParam.setPreviewSize(mWidth, mHeight);
+                        hdmirxParam.setPreviewFrameRate(mFps);
+                        mHDMIRX.setParameters(hdmirxParam);
+                        mHDMIRX.setPlayback(true, true);
+                        driverReady = true;
+                        stateCallback(HDMI_DRIVER_READY);
+
+                    } catch (IOException e) {
+                        Log.e(TAG, "initHDMIDriver: Exception setting preview display", e);
+                        errorCallback(OGHdmiError.HDMI_UNAVAILABLE, "Could not set preview display. Really bad.");
+                        orderlyShutdownDriver();
+                        e.printStackTrace();
+                    }
+                }
+
+            } else {
+                sendFYIStatus(rxStatus);
+                Log.d(TAG, "initHDMIDriver:  got an non-ready status from the driver. Fuck.");
+                Log.d(TAG, "initHDMIDriver:  Status ( 0 = not ready ): " + rxStatus.status);
+                errorCallback(OGHdmiError.HDMI_UNAVAILABLE, "Got non-ready status from driver. Unplugged?");
+                //cleanUpBadManager();
+                orderlyShutdownDriver();
+            }
+
+
+        } else {
+            Log.d(TAG, "initHDMIDriver called and there already is a manager. Think about your choices.");
+            errorCallback(HDMI_DRIVER_ALREADY_OPEN, "");
         }
 
     }
 
-    private void initView() {
 
-        mSurfaceView = new SurfaceView(mContext);
-        mSurfaceHolder = mSurfaceView.getHolder();
-        mSurfaceHolder.addCallback(new SurfaceHolder.Callback() {
+    //Scott's method
+    public void pauseHDMI() {
 
-            @Override
-            public void surfaceChanged(SurfaceHolder arg0, int arg1, int width, int height) {
-                Log.v(TAG, "Surface changed");
-                stateCallback(SURFACE_CHANGED);
+        Log.v(TAG, "pauseHDMI() called.");
+        fyiCallback("pauseHDMI() called");
+
+        if (mHDMIRX != null) {
+
+            if (driverReady) {
+                mHandler.sendEmptyMessage(STOP_MSG);
+                stopStreamer();
             }
 
-            @Override
-            public void surfaceCreated(SurfaceHolder arg0) {
-                Log.v(TAG, "SurfaceCreated");
-                mHDMISurfaceReady = true;
-                stateCallback(SURFACE_READY);
+            stateCallback(HDMI_PAUSED);
+        }
+        //(new SystemStatusMessage(SystemStatusMessage.SystemStatus.HDMI_PAUSE)).post();
+
+    }
+
+    /**
+     *
+     * SHUTDOWN ORDER:
+     * 1. Remove the preview display
+     * 2. .release() the manager
+     * 3. null the driver
+     */
+
+    public void releaseHDMI() {
+        Log.d(TAG, "releaseHDMI() called.");
+        fyiCallback("releaseHDMI() called");
+        if (mHDMIRX != null ) {
+
+            mHDMIRX.stop();
+
+            try {
+                mHDMIRX.setPreviewDisplay(null);
+            } catch (IOException e) {
+                Log.wtf(TAG,"Exception thrown releasing preview display.");
             }
 
-            @Override
-            public void surfaceDestroyed(SurfaceHolder arg0) {
-                Log.v(TAG, "SurfaceDestroyed");
-                mHDMISurfaceReady = false;
-                stateCallback(SURFACE_DESTROYED);
+            mHDMIRX.release();
+            mHDMIRX = null;
+            driverReady = false;
+            Log.d(TAG, "releaseHDMI() complete");
+            fyiCallback("driver nulled");
+            stateCallback(HDMI_STOP_AND_RELEASE);
+
+
+        }
+    }
+
+    // Scott's method...more tested
+    private void orderlyShutdownDriver() {
+
+        Log.d(TAG, "orderlyShutdownDriver shutdown called");
+        fyiCallback("Orderly shutdown requested");
+
+        if (!autoShutdownOnError) {
+            errorCallback(FYI, "Shutdown called, but auto shutdown is disbaled, ignoring!");
+            return;
+        }
+
+        if (mHDMIRX != null ) {
+            Log.d(TAG, "orderlyShutdownDriver calling stop() on driver..");
+            int stopResult = mHDMIRX.stop();
+            Log.d(TAG, "orderlyShutdownDriver result of driver stop was (0=good) " + stopResult);
+            releaseHDMI();
+            Log.d(TAG, "orderlyShutdownDriver complete");
+            fyiCallback("orderly shutdown complete");
+
+        } else {
+            Log.d(TAG, "orderlyShutdownDriver called on null driver");
+        }
+
+    }
+
+
+    public void playHDMI() {
+
+        Log.d(TAG, "playHDMI() called.");
+        fyiCallback("playHDMI()");
+
+        if (driverReady) {
+            mHandler.sendEmptyMessage(PLAY_MSG);
+            stateCallback(HDMI_PLAY);
+        } else {
+            Log.d(TAG, "playHDMI() called and driver not ready, piss off.");
+            fyiCallback("Play called on a non-ready driver. Ignored.");
+        }
+
+    }
+
+
+    private void getSupportedPreviewFrameRate(HDMIRxParameters hdmirxGetParam) {
+        List<Integer> previewFrameRates = hdmirxGetParam.getSupportedPreviewFrameRates();
+        int fps = 0;
+        if (previewFrameRates != null && previewFrameRates.size() > 0)
+            fps = previewFrameRates.get(previewFrameRates.size() - 1);
+        else
+            fps = 30;
+        mFps = fps;
+    }
+
+    private void getSupportedPreviewSize(HDMIRxParameters hdmirxGetParam, int rxWidth, int rxHeight) {
+        List<RtkHDMIRxManager.Size> previewSizes = hdmirxGetParam.getSupportedPreviewSizes();
+        int retWidth = 0, retHeight = 0;
+        if (previewSizes == null || previewSizes.size() <= 0)
+            return;
+        for (int i = 0; i < previewSizes.size(); i++) {
+            if (previewSizes.get(i) != null && rxWidth == previewSizes.get(i).width) {
+                retWidth = previewSizes.get(i).width;
+                retHeight = previewSizes.get(i).height;
+                if (rxHeight == previewSizes.get(i).height)
+                    break;
             }
+        }
+        if (retWidth == 0 && retHeight == 0) {
+            if (previewSizes.get(previewSizes.size() - 1) != null) {
+                retWidth = previewSizes.get(previewSizes.size() - 1).width;
+                retHeight = previewSizes.get(previewSizes.size() - 1).height;
+            }
+        }
 
-        });
+        mWidth = retWidth;
+        mHeight = retHeight;
+    }
 
 
-        LayoutParams param = new LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
-        mSurfaceView.setLayoutParams(param);
-        mSurfaceHolderView.addView(mSurfaceView);
+    // "SAFE" METHODS. Nothing in here needs reverse engineering
 
+
+    // Scott's audio Stuff, Commented Out for Now
+
+    private ParcelFileDescriptor[] ffPipe = null;
+    //private AudioStreamer mAudioStreamer = null;
+    private boolean isStreaming = false;
+
+    public boolean isStreaming() {
+        return isStreaming;
     }
 
     private void initStreamer() {
@@ -238,452 +563,37 @@ public class RtkHdmiWrapper {
 //        });
     }
 
-    private void registerBroadcastRx() {
-
-        mHdmiRxHotPlugReceiver = new BroadcastReceiver() {
-            @Override
-            public void onReceive(Context context, Intent intent) {
-
-                hdmiConnectedState = intent.getBooleanExtra(HDMIRxStatus.EXTRA_HDMIRX_PLUGGED_STATE, false);
-                Log.v(TAG, "HDMI Connected state received is " + hdmiConnectedState);
-                OGHdmiState cstate = hdmiConnectedState ? HDMI_PHY_CONNECTED : HDMI_PHY_NOT_CONNECTED;
-                stateCallback(cstate);
-
-            }
-        };
-
-        IntentFilter hdmiRxFilter = new IntentFilter(HDMIRxStatus.ACTION_HDMIRX_PLUGGED);
-
-        // Read it once.
-        Intent pluggedStatus = mContext.registerReceiver(null, hdmiRxFilter);
-        hdmiConnectedState = pluggedStatus.getBooleanExtra(HDMIRxStatus.EXTRA_HDMIRX_PLUGGED_STATE, false);
-        Log.v(TAG, "registerBroadcastRx Connected state read directly is " + hdmiConnectedState);
-
-        // Watch it.
-        mContext.registerReceiver(mHdmiRxHotPlugReceiver, hdmiRxFilter);
-
-    }
-
-
-    /**
-     * Calls back state change to listener if one is registered.
-     *
-     * @param state
-     */
-    private void stateCallback(OGHdmiState state) {
-        Log.d(TAG, "HDMI stateCallback: " + state.name());
-        if (mListener != null) {
-            mListener.hdmiStateChange(state);
-        }
-    }
-
-    /**
-     * Calls backerror to listener if one is registered.
-     *
-     * @param error
-     * @param msg
-     */
-    private void errorCallback(OGHdmiError error, String msg) {
-        if (mListener != null) {
-            mListener.error(error, msg);
-        }
-    }
-
-    /**
-     * Calls back fyi to listener if one is registered.
-     *
-     * @param msg
-     */
-    private void fyiCallback( String msg ) {
-        if (mListener != null) {
-            mListener.fyi(msg);
-        }
-    }
-
-    private void sendFYIStatus(HDMIRxStatus rxStatus){
-
-        if (debugMode){
-            StringBuilder sb = new StringBuilder("RxManager Status:\n");
-            sb.append("type = "+rxStatus.type + "\n");
-            sb.append("status = "+rxStatus.status + "\n");
-            sb.append("width = "+rxStatus.width + "\n");
-            sb.append("height = "+rxStatus.height + "\n");
-            sb.append("scanMode = "+rxStatus.scanMode + "\n");
-            sb.append("color = "+rxStatus.color + "\n");
-            sb.append("freq = "+rxStatus.freq + "\n");
-            sb.append("spdif = "+rxStatus.spdif + "\n");
-            sb.append("audioStatus = "+rxStatus.audioStatus + "\n");
-            fyiCallback(sb.toString());
-        }
-    }
-
-    private void orderlyShutdownDriver() {
-
-        Log.d(TAG, "orderlyShutdownDriver shutdown called");
-
-        if (!autoShutdownOnError) {
-            errorCallback(FYI, "Shutdown called, but autoshutdown is disbaled, ignoring!");
-            return;
-        }
-
-        if (mHDMIRX != null ) {
-            Log.d(TAG, "orderlyShutdownDriver calling stop() on driver..");
-            int stopResult = mHDMIRX.stop();
-            Log.v(TAG, "orderlyShutdownDriver result of driver stop was (0=good) " + stopResult);
-            Log.v(TAG, "orderlyShutdownDriver releasing native driver, he's probably shitty at it anyway.");
-            mHDMIRX.release();
-            mHDMIRX = null;
-            driverReady = false;
-            Log.d(TAG, "orderlyShutdownDriver complete");
-
-        } else {
-            Log.d(TAG, "orderlyShutdownDriver called on null driver");
-        }
-
-    }
-
-    public void cleanUpBadManager(){
-        try {
-            mHDMIRX.release();
-        } catch (Exception e){
-            Log.wtf(TAG, "Shat meself cleaning up manager");
-            Log.wtf(TAG, e.getMessage());
-        } finally {
-            mHDMIRX = null;
-        }
-
-        errorCallback(FYI, "Cleaned up RxManager");
-    }
-
-    public void initHDMIDriver() {
-
-        if (mHDMIRX == null) {
-            Log.d(TAG, "initHDMIDriver called and there is no HDMIRxManager (null), creating");
-            Log.d(TAG, "...this is normal, relax.");
-
-            fyiCallback("Creating new RxManager instance");
-
-            driverReady = false;
-            mWidth = 0;
-            mHeight = 0;
-
-            mHDMIRX = new RtkHDMIRxManager();
-
-            HDMIRxStatus rxStatus = mHDMIRX.getHDMIRxStatus();
-
-            if (rxStatus == null) {
-
-                Log.wtf(TAG, "initHDMIDriver: rxStatus from chipset is NULL. This is a hard fucking fail!");
-                errorCallback(OGHdmiError.HDMI_UNAVAILABLE, "NULL status returned. This blows hard.");
-                // Just in case, orderly shutdown
-                cleanUpBadManager();
-
-            } else if (rxStatus.status == HDMIRxStatus.STATUS_READY) {
-
-                Log.v(TAG, "initHDMIDriver: HDMI status is STATUS_READY, trying open driver.");
-                sendFYIStatus(rxStatus);
-
-                // This registers package name with underlying shitty C code
-                //if (mHDMIRX.open() != 0) {
-
-                int openStatus = mHDMIRX.open();
-                if (openStatus != 0) {
-                    // Could not open the driver, so we are probably really fucked
-
-                    // SUPER FUCKING IMPORTANT!!!
-                    // Your entire view hierarchy is now POISONED. If you touch anything, the underlying driver will crash!!!
-                    Log.d(TAG, "initHDMIDriver: Could not open driver (" + openStatus + "). Probably we are fucked. Attempting release(), better close your eyes.");
-                    // Release does nothing
-                    //mHDMIRX.release();
-                    errorCallback(OGHdmiError.HDMI_CANT_OPEN_DRIVER, "Could not open the driver. This blows hard.");
-                    // Well, it looks like this is another inconsistency. Can't replicate this now.
-
-                    Log.d(TAG, "initHDMIDriver: Could not open driver. Probably we are fucked. Attempting release(), better close your eyes.");
-                    cleanUpBadManager();
-                    errorCallback(OGHdmiError.HDMI_CANT_OPEN_DRIVER, "Could not open the driver.");
-                    orderlyShutdownDriver();
-
-                } else {
-
-                    // So good so far
-                    Log.d(TAG, "initHDMIDriver: successfully opened the driver. So we got that going for us.");
-                    HDMIRxParameters hdmirxGetParam = mHDMIRX.getParameters();
-                    Log.v(TAG, "initHDMIDriver: Params from driver: " + hdmirxGetParam.flatten());
-                    fyiCallback("Params from driver: \n");
-                    fyiCallback(hdmirxGetParam.flatten());
-
-                    getSupportedPreviewSize(hdmirxGetParam, rxStatus.width, rxStatus.height);
-                    getSupportedPreviewFrameRate(hdmirxGetParam);
-
-                    try {
-                        mHDMIRX.setPreviewDisplay(mSurfaceHolder);
-                        // configureTargetFormat
-                        HDMIRxParameters hdmirxParam = new HDMIRxParameters();
-                        Log.v(TAG, "initHDMIDriver: hdmi setPreviewSize  mWidth = " + mWidth + "  mHeight = " + mHeight + "  mFps = " + mFps);
-                        hdmirxParam.setPreviewSize(mWidth, mHeight);
-                        hdmirxParam.setPreviewFrameRate(mFps);
-                        mHDMIRX.setParameters(hdmirxParam);
-                        driverReady = true;
-                        stateCallback(HDMI_DRIVER_READY);
-
-                    } catch (IOException e) {
-                        Log.e(TAG, "initHDMIDriver: Exception setting preview display", e);
-                        errorCallback(OGHdmiError.HDMI_UNAVAILABLE, "Could not set preview display. Really bad.");
-                        orderlyShutdownDriver();
-                        e.printStackTrace();
-                    }
-                }
-
-            } else {
-                sendFYIStatus(rxStatus);
-                Log.d(TAG, "initHDMIDriver:  got an non-ready status from the driver. Fuck.");
-                Log.d(TAG, "initHDMIDriver:  Status ( 0 = not ready ): " + rxStatus.status);
-                errorCallback(OGHdmiError.HDMI_UNAVAILABLE, "Got non-ready status from driver. Unplugged?");
-                cleanUpBadManager();
-            }
-
-
-        } else {
-            Log.d(TAG, "initHDMIDriver called and there already is a manager. Think about your choices.");
-            errorCallback(HDMI_DRIVER_ALREADY_OPEN, "");
-        }
-
-    }
-
-    /**
-     * Kill this shit dead. May not be resurrectable?
-     */
-    public void kill() {
-
-        Log.v(TAG, "kill() called.");
-        if (mSurfaceView != null) {
-
-            Log.v(TAG, "kill() hiding Surface View");
-            //mSurfaceView.setVisibility(View.INVISIBLE);
-        }
-
-        orderlyShutdownDriver();
-
-        iThinkHDMIisPlaying = false;
-        mFps = 0;
-        mWidth = 0;
-        mHeight = 0;
-
-        stateCallback(HDMI_STOP_AND_RELEASE);
-
-        if (mHdmiRxHotPlugReceiver != null) {
-            mContext.unregisterReceiver(mHdmiRxHotPlugReceiver);
-            mHdmiRxHotPlugReceiver = null;
-        }
-
-        //(new SystemStatusMessage(SystemStatusMessage.SystemStatus.HDMI_STOP)).post();
-
-    }
-
-    /**
-     * Does much the same shit as kill, without releasing the driver
-     */
-    public void pause() {
-
-        Log.v(TAG, "pause() called.");
-        if (mSurfaceView != null) {
-            Log.v(TAG, "pause() NOT hiding Surface View (commented out)");
-            //mSurfaceView.setVisibility(View.INVISIBLE);
-        }
-
-        if (mHDMIRX != null) {
-            Log.v(TAG, "pause() calling stop() on driver..");
-            mHDMIRX.setPlayback(false, false);
-            int stopResult = mHDMIRX.stop();
-            Log.v(TAG, "pause() result of driver stop was (0=good) " + stopResult);
-            Log.v(TAG, "pause() NOT! releasing native driver, maybe this will help.");
-
-        }
-
-        iThinkHDMIisPlaying = false;
-//        mFps = 0;
-//        mWidth = 0;
-//        mHeight = 0;
-        stateCallback(HDMI_PAUSED);
-        //(new SystemStatusMessage(SystemStatusMessage.SystemStatus.HDMI_PAUSE)).post();
-
-    }
-
-    public void pauseMain() {
-
-        Log.v(TAG, "pause() called.");
-        if (mSurfaceView != null) {
-            Log.v(TAG, "pause() NOT hiding Surface View (commented out)");
-            //mSurfaceView.setVisibility(View.INVISIBLE);
-        }
-
-        if (mHDMIRX != null) {
-
-            if (driverReady) {
-                (new Thread(new Runnable() {
-                    @Override
-                    public void run() {
-                        mHDMIRX.setPlayback(false, false);
-                        int stopResult = mHDMIRX.stop();
-                        iThinkHDMIisPlaying = false;
-                        Log.v(TAG, "pause() result of driver stop was (0=good) " + stopResult);
-                    }
-                })).start();
-            }
-
-            stateCallback(HDMI_PAUSED);
-        }
-        //(new SystemStatusMessage(SystemStatusMessage.SystemStatus.HDMI_PAUSE)).post();
-
-    }
-
-    public void release() {
-        Log.d(TAG, "release() called.");
-        if (mHDMIRX != null ) {
-
-            try {
-                mHDMIRX.setPreviewDisplay(null);
-            } catch (IOException e) {
-            }
-
-            mHDMIRX.release();
-            mHDMIRX = null;
-            driverReady = false;
-            Log.d(TAG, "orderlyShutdownDriver complete");
-
-        }
-    }
-
-    public void play() {
-
-        Log.d(TAG, "play() called.");
-
-        // These checks are probably overkill, but they won't hurt anything
-
-        if (mSurfaceView == null) {
-            // TODO this should throw and really not even be possible
-            Log.wtf(TAG, "play() called on a null surface view, bailing");
-            errorCallback(OGHdmiError.NULL_SURFACE_VIEW, "There is no surface view to play on, this is not cool yo.");
-            return;
-        }
-
-        if (!mHDMISurfaceReady) {
-            Log.e(TAG, "play() called and HDMI SurfaceView isn't ready yet, gonna chill a bit (1 sec) and retry.");
-            errorCallback(OGHdmiError.SURFACE_NOT_READY, "Play called on a surface that is not ready");
-            return;
-        }
-
-        //SJMNOLog.d(TAG, "play() making surfaceview visible");
-        //SJMNOmSurfaceView.setVisibility(View.VISIBLE);
-
-        Log.v(TAG, "play------------- What I *think* HDMI is playing = " + iThinkHDMIisPlaying + " HDMI surface ready = " + mHDMISurfaceReady);
-
-        if (driverReady) {
-
-//            mHandler.post(new Runnable() {
-//                @Override
-//                public void run() {
-//                    mHDMIRX.play();
-//                    iThinkHDMIisPlaying = true;
-//                    mHDMIRX.setPlayback(true, true);
-//                    Log.d(TAG, "hdmi mIsPlaying successfully, I hope");
-//                }
-//            });
-
-            (new Thread(new Runnable() {
-                @Override
-                public void run() {
-                    mHDMIRX.play();
-                    iThinkHDMIisPlaying = true;
-                    mHDMIRX.setPlayback(true, true);
-                    Log.d(TAG, "hdmi mIsPlaying successfully, I hope");
-                }
-            })).start();
-
-            stateCallback(HDMI_PLAY);
-            //(new SystemStatusMessage(SystemStatusMessage.SystemStatus.HDMI_PLAY)).post();
-
-        } else {
-            Log.d(TAG, "play() called and driver not ready, piss off.");
-        }
-
-
-    }
-
-
-    private void getSupportedPreviewFrameRate(HDMIRxParameters hdmirxGetParam) {
-        List<Integer> previewFrameRates = hdmirxGetParam.getSupportedPreviewFrameRates();
-        int fps = 0;
-        if (previewFrameRates != null && previewFrameRates.size() > 0)
-            fps = previewFrameRates.get(previewFrameRates.size() - 1);
-        else
-            fps = 30;
-        mFps = fps;
-    }
-
-    private void getSupportedPreviewSize(HDMIRxParameters hdmirxGetParam, int rxWidth, int rxHeight) {
-        List<RtkHDMIRxManager.Size> previewSizes = hdmirxGetParam.getSupportedPreviewSizes();
-        int retWidth = 0, retHeight = 0;
-        if (previewSizes == null || previewSizes.size() <= 0)
-            return;
-        for (int i = 0; i < previewSizes.size(); i++) {
-            if (previewSizes.get(i) != null && rxWidth == previewSizes.get(i).width) {
-                retWidth = previewSizes.get(i).width;
-                retHeight = previewSizes.get(i).height;
-                if (rxHeight == previewSizes.get(i).height)
-                    break;
-            }
-        }
-        if (retWidth == 0 && retHeight == 0) {
-            if (previewSizes.get(previewSizes.size() - 1) != null) {
-                retWidth = previewSizes.get(previewSizes.size() - 1).width;
-                retHeight = previewSizes.get(previewSizes.size() - 1).height;
-            }
-        }
-
-        mWidth = retWidth;
-        mHeight = retHeight;
-    }
-
-    public void setSize(boolean isFull) {
-        if (isFull) {
-            LayoutParams param = (LayoutParams) mRootView.getLayoutParams();
-            param.width = ViewGroup.LayoutParams.MATCH_PARENT;
-            param.height = ViewGroup.LayoutParams.MATCH_PARENT;
-            mRootView.setLayoutParams(param);
-        } else {
-            LayoutParams param = (LayoutParams) mRootView.getLayoutParams();
-            param.width = (int) (640 * 1.5f);
-            param.height = (int) (420 * 1.5f);
-            mRootView.setLayoutParams(param);
-        }
-    }
-
-
-    public boolean isStreaming() {
-        return isStreaming;
-    }
-
     public void stopStreamer() {
-        try {
-            isStreaming = false;
-            if (mHDMIRX != null) {
-                mHDMIRX.setTranscode(false);
-            }
+
+        if (isStreaming){
+            try {
+                isStreaming = false;
+                if (mHDMIRX != null) {
+                    mHDMIRX.setTranscode(false);
+                }
 //            if (mAudioStreamer != null) {
 //                mAudioStreamer.killStream();
 //            }
 
-            //Toast.makeText(mContext, "Stop streamer successful!", Toast.LENGTH_SHORT).show();
-            //ABApplication.dbToast("Stop streamer successful!");
+                //Toast.makeText(mContext, "Stop streamer successful!", Toast.LENGTH_SHORT).show();
+                //ABApplication.dbToast("Stop streamer successful!");
 
-        } catch (Exception e) {
-            Log.e(TAG, "Exception mHDMIRX.setTranscode2", e);
-            ;
+            } catch (Exception e) {
+                Log.e(TAG, "Exception mHDMIRX.setTranscode2", e);
+                ;
+            }
+
         }
+
     }
 
     public void startStreamer() {
+
+            if (isStreaming) {
+                fyiCallback("Start streaming called, but already streaming.");
+                return;
+            }
+
 //        int videoBitrate = OGConstants.BUCANERO_AV_V_BITRATE;
 //        int channelCount = OGConstants.BUCANERO_AV_A_CHANNELS;
 //        int sampleRate = OGConstants.BUCANERO_AV_A_SAMPLERATE;
@@ -725,4 +635,27 @@ public class RtkHdmiWrapper {
 //            ;
 //        }
     }
+
+
+    // Garbage Area
+
+    // Not sure what this ever did
+    @Deprecated
+    public void setSize(boolean isFull) {
+        if (isFull) {
+            LayoutParams param = (LayoutParams) mRootView.getLayoutParams();
+            param.width = ViewGroup.LayoutParams.MATCH_PARENT;
+            param.height = ViewGroup.LayoutParams.MATCH_PARENT;
+            mRootView.setLayoutParams(param);
+        } else {
+            LayoutParams param = (LayoutParams) mRootView.getLayoutParams();
+            param.width = (int) (640 * 1.5f);
+            param.height = (int) (420 * 1.5f);
+            mRootView.setLayoutParams(param);
+        }
+    }
+
+
+
+
 }
